@@ -2,6 +2,9 @@
 
 File: Lab5_logicAnalyzer.ino 
 Functionality: Creates the logic analyzer for our program.
+Author: James Henry
+Group # 5
+Course: CECS 460 - System on Chip Design
 
  */
 
