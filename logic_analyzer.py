@@ -1,297 +1,265 @@
-"""
-CECS 460 Lab 5 - Logic Analyzer Visualization 
-Python script to capture and display waveforms from ESP32
+'''
 
-Requirements: pip install pyserial matplotlib numpy
-"""
+Lab # 5 
+Class: CECS 460 - System on Chip Design 
+Students: James Henry, Emily Gomez, Eric Santana
+Functionality: BPSK Logic Analyzer that generates static PNG, animated GIF, and VCD files. This is 
+based on the ESP32's I/O for the tx to rx signal. 
 
-import serial
-import serial.tools.list_ports
-import time
-import matplotlib.pyplot as plt
+'''
+
 import numpy as np
-from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+from pathlib import Path
 
-# --- Configuration (MUST MATCH ESP32 CODE) ---
-COM_PORT = 'COM3'  # <<<--- CHANGE THIS to ESP32's COM port
-BAUD_RATE = 115200
-SAMPLES_PER_CAPTURE = 2000
-SAMPLE_RATE_HZ = 1000000  # 1 MHz sampling rate
+# ------------------------
+# Simple DSP helpers (no SciPy)
+# ------------------------
+def awgn(x, snr_db):
+    if np.isinf(snr_db):
+        return x
+    p_sig = np.mean(np.abs(x)**2)
+    snr_lin = 10**(snr_db/10.0)
+    p_noise = p_sig / snr_lin
+    noise = np.sqrt(p_noise/2.0) * np.random.randn(*x.shape)
+    return x + noise
 
-# GPIO Pin numbers (for display only)
-TX_PIN = 18 
-RX_PIN = 19
+def stretch_bits(bits, sps):
+    return np.repeat(bits, sps)
 
-# Markers (Must match ESP32 firmware)
-START_MARKER = ord('S')  # ASCII value of 'S'
-END_MARKER = ord('E')    # ASCII value of 'E'
+def bit_edges(bits, sps):
+    edges = np.zeros(bits.size * sps, dtype=int)
+    tb = np.concatenate([[bits[0]], bits[:-1]])
+    transitions = np.nonzero(bits != tb)[0]
+    for idx in transitions:
+        pos = idx * sps
+        if pos < edges.size:
+            edges[pos] = 1
+    return edges
 
-def list_serial_ports():
-    """List all available serial ports"""
-    ports = serial.tools.list_ports.comports()
-    available_ports = []
-    
-    print("\nAvailable serial ports:")
-    if not ports:
-        print("  No serial ports found!")
-    else:
-        for port in ports:
-            print(f"  {port.device} - {port.description}")
-            available_ports.append(port.device)
-    
-    return available_ports
+def make_symbol_clock(n_samples, sps):
+    clk = np.zeros(n_samples, dtype=int)
+    half = sps // 2
+    for k in range(0, n_samples, sps):
+        clk[k:k+half] = 1
+    return clk
 
-def connect_to_esp32(port, baud):
-    """Establish serial connection to ESP32"""
+def bpsk_mod(bits_pm, sps, fc, fs):
+    bb = stretch_bits(bits_pm, sps)
+    n = np.arange(bb.size)
+    carrier = np.cos(2*np.pi*fc*n/fs)
+    rf = bb * carrier
+    return rf
+
+def lowpass_ma(x, taps=129):
+    # Moving-average low-pass (simple and dependency-free)
+    if taps % 2 == 0:
+        taps += 1
+    h = np.ones(taps, dtype=float) / float(taps)
+    return np.convolve(x, h, mode='same')
+
+def demod_coherent(rf, fc, fs, lp_len=129):
+    n = np.arange(rf.size)
+    lo = np.cos(2*np.pi*fc*n/fs)
+    mixed = rf * lo
+    bb = lowpass_ma(mixed, taps=lp_len)
+    return bb
+
+def integrate_and_dump(bb, sps):
+    n = (bb.size // sps) * sps
+    if n == 0:
+        return np.array([]), np.array([], dtype=int)
+    bb_reshaped = bb[:n].reshape(-1, sps)
+    samples = bb_reshaped.mean(axis=1)
+    hard = (samples > 0).astype(int)
+    return samples, hard
+
+def to_logic_levels(x):
+    return (x > 0).astype(int)
+
+def write_vcd(channels, fs, path, timescale='1us'):
+    # Minimal VCD writer for 1-bit channels
+    ids = {}
+    printable = [chr(i) for i in range(33, 126)]
+    for i, k in enumerate(channels.keys()):
+        ids[k] = printable[i % len(printable)]
+
+    dt_s = 1.0 / fs
+    ts_factor = {
+        '1ns':1e-9,'10ns':10e-9,'100ns':100e-9,
+        '1us':1e-6,'10us':10e-6,'100us':100e-6,
+        '1ms':1e-3
+    }[timescale]
+    tick_per_sample = max(1, int(round(dt_s / ts_factor)))
+
+    with open(path, 'w') as f:
+        f.write("$date\n  generated\n$end\n")
+        f.write("$version\n  logic_analyzer.py\n$end\n")
+        f.write(f"$timescale {timescale} $end\n")
+        f.write("$scope module logic $end\n")
+        for name, sym in ids.items():
+            f.write(f"$var wire 1 {sym} {name} $end\n")
+        f.write("$upscope $end\n$enddefinitions $end\n")
+
+        # Initial values
+        f.write("#0\n")
+        prev = {}
+        for name, sym in ids.items():
+            v = int(channels[name][0])
+            f.write(f"{v}{sym}\n")
+            prev[name] = v
+
+        # Changes
+        for i in range(1, len(next(iter(channels.values())))):
+            changed = []
+            for k, arr in channels.items():
+                v = int(arr[i])
+                if v != prev[k]:
+                    changed.append((k, v))
+                    prev[k] = v
+            if changed:
+                t = i * tick_per_sample
+                f.write(f"#{t}\n")
+                for k, v in changed:
+                    f.write(f"{v}{ids[k]}\n")
+
+# ------------------------
+# Main (generate PNG, GIF, VCD)
+# ------------------------
+def main():
+    # Parameters chosen to run fast and look clean
+    Rs = 50_000.0     # symbol rate (baud)
+    fs = 1_000_000.0  # sample rate (Hz)
+    fc = 200_000.0    # carrier (Hz)
+    snr_db = 12.0
+    sps = int(round(fs / Rs))  # 20 samples/symbol
+    n_bits = 80
+
+    # ----- One static capture -----
+    tx_bits = np.random.randint(0, 2, size=n_bits).astype(int)
+    tx_pm = 2*tx_bits - 1
+
+    rf = bpsk_mod(tx_pm, sps, fc, fs)
+    rx = awgn(rf, snr_db)
+    bb = demod_coherent(rx, fc, fs)
+
+    rx_sign = to_logic_levels(bb)
+    _, rx_bits = integrate_and_dump(bb, sps)
+
+    tx_bit_line = stretch_bits(tx_bits, sps)
+    rx_bit_line = stretch_bits(rx_bits, sps)
+    sym_clk = make_symbol_clock(tx_bit_line.size, sps)
+    edge = bit_edges(tx_bits, sps)
+
+    m = min(rx_bits.size, tx_bits.size)
+    ber = float(np.sum(rx_bits[:m] != tx_bits[:m])) / float(m) if m else 0.0
+
+    # ----- Static stacked PNG (single axis) -----
+    N_syms_view = 20
+    N = N_syms_view * sps
+    t = np.arange(N) / fs
+
+    channels = [
+        ("TX_BIT",   tx_bit_line[:N]),
+        ("SYM_CLK",  sym_clk[:N]),
+        ("RX_SIGN",  rx_sign[:N]),
+        ("RX_BIT",   rx_bit_line[:N]),
+        ("BIT_EDGE", edge[:N]),
+    ]
+    labels = [name for name, _ in channels]
+    offset_step = 2.0
+
+    fig1 = plt.figure(figsize=(10, 4))
+    ax = plt.gca()
+    for i, (_, arr) in enumerate(channels):
+        ax.step(t, arr + i*offset_step, where='post')  # no explicit colors
+    ax.set_yticks([i*offset_step for i in range(len(labels))])
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"BPSK Logic Analyzer (PC3)  |  Rs={Rs:.0f} Bd  fs={fs:.0f} Hz  fc={fc:.0f} Hz  SNR={snr_db} dB  |  BER≈{ber:.3g}")
+    ax.grid(True, which='both', alpha=0.3)
+    fig1.tight_layout()
+    static_png = Path("bpsk_logic_static.png")
+    fig1.savefig(static_png)
+    plt.close(fig1)
+
+    # ----- Short realtime-style GIF (single axis) -----
+    win_syms = 120
+    Nwin = win_syms * sps
+    x = np.arange(Nwin) / fs
+    buf = np.zeros((len(channels), Nwin), dtype=float)
+
+    fig2 = plt.figure(figsize=(10, 4))
+    ax2 = plt.gca()
+    lines = []
+    for i in range(len(channels)):
+        (ln,) = ax2.step(x, buf[i] + i*offset_step, where='post')
+        lines.append(ln)
+    ax2.set_yticks([i*offset_step for i in range(len(labels))])
+    ax2.set_yticklabels(labels)
+    ax2.set_xlabel("Time (s)")
+    ax2.set_title("BPSK Logic Analyzer (PC3)")
+    ax2.grid(True, which='both', alpha=0.3)
+    fig2.tight_layout()
+
+    one_sym_clk = np.concatenate([np.ones(sps//2, dtype=int),
+                                  np.zeros(sps - sps//2, dtype=int)])
+    chunk_syms = 8
+    chunk_samps = chunk_syms * sps
+
+    def anim_step(_i):
+        tx_bits_chunk = np.random.randint(0, 2, size=chunk_syms).astype(int)
+        tx_pm_chunk = 2*tx_bits_chunk - 1
+
+        rf_chunk = bpsk_mod(tx_pm_chunk, sps, fc, fs)
+        rx_chunk = awgn(rf_chunk, snr_db)
+        bb_chunk = demod_coherent(rx_chunk, fc, fs)
+
+        rx_sign_chunk = to_logic_levels(bb_chunk)
+        _, rx_bits_chunk = integrate_and_dump(bb_chunk, sps)
+
+        tx_line = stretch_bits(tx_bits_chunk, sps)
+        rx_line = stretch_bits(rx_bits_chunk, sps)
+        clk_line = np.tile(one_sym_clk, chunk_syms)
+        edge_line = bit_edges(tx_bits_chunk, sps)
+
+        new_rows = [tx_line, clk_line, rx_sign_chunk[:chunk_samps], rx_line, edge_line]
+
+        # scroll buffers
+        for i in range(len(channels)):
+            buf[i, :-chunk_samps] = buf[i, chunk_samps:]
+            buf[i, -chunk_samps:] = new_rows[i]
+
+        for i, ln in enumerate(lines):
+            ln.set_ydata(buf[i] + i*offset_step)
+
+        ax2.set_title("BPSK Logic Analyzer (PC3)")
+        return lines
+
+    ani = FuncAnimation(fig2, anim_step, frames=60, interval=80, blit=False)
+    gif_path = Path("BPSK_Logic_Analyzer_PC3.gif")
     try:
-        print(f"\nAttempting to connect to {port} at {baud} baud...")
-        
-        # Timeout must be long enough to receive all data
-        # 2000 bytes @ 115200 baud = ~174ms + margin
-        ser = serial.Serial(port, baud, timeout=0.5)
-        
-        # Wait for ESP32 to reset after serial connection
-        time.sleep(2)
-        
-        # Synchronize with ESP32 (clear any partial data)
-        print("Synchronizing with ESP32...")
-        ser.flushInput()
-        time.sleep(0.1)
-        
-        # Discard any pending data
-        while ser.in_waiting > 0:
-            ser.read(ser.in_waiting)
-            time.sleep(0.05)
-        
-        print("✓ Connection successful!")
-        print("✓ Synchronized with ESP32")
-        print("\nWaiting for ESP32 to trigger and send data...")
-        print("(Trigger occurs on falling edge of TX pin)\n")
-        
-        return ser
-        
-    except serial.SerialException as e:
-        print(f"\n✗ ERROR: Could not open serial port {port}")
-        print("  Please check:")
-        print("  - Port name is correct")
-        print("  - ESP32 is connected via USB")
-        print("  - Port is not already in use (close Arduino IDE serial monitor)")
-        print(f"\n  Details: {e}")
-        return None
-
-def decode_capture(raw_data):
-    """Decode packed binary data into TX and RX signals"""
-    # Convert raw bytes to NumPy array
-    data_array = np.frombuffer(raw_data, dtype=np.uint8)
-    
-    # Extract TX signal (bit 0)
-    tx_data = data_array & 0x01
-    
-    # Extract RX signal (bit 1)
-    rx_data = (data_array >> 1) & 0x01
-    
-    return tx_data, rx_data
-
-def analyze_signal(tx_data, rx_data, sample_rate):
-    """Analyze captured signals and print statistics"""
-    # Count signal transitions (edges)
-    tx_transitions = np.sum(np.abs(np.diff(tx_data)))
-    rx_transitions = np.sum(np.abs(np.diff(rx_data)))
-    
-    # Calculate signal statistics
-    tx_high_time = np.sum(tx_data) / sample_rate * 1000  # ms
-    rx_high_time = np.sum(rx_data) / sample_rate * 1000  # ms
-    
-    # Find first transition in each signal (for propagation delay)
-    tx_first_edge = np.where(np.diff(tx_data) != 0)[0]
-    rx_first_edge = np.where(np.diff(rx_data) != 0)[0]
-    
-    propagation_delay = 0
-    if len(tx_first_edge) > 0 and len(rx_first_edge) > 0:
-        propagation_delay = (rx_first_edge[0] - tx_first_edge[0]) / sample_rate * 1e6  # μs
-    
-    # Print analysis
-    print("\n" + "="*50)
-    print("SIGNAL ANALYSIS")
-    print("="*50)
-    print(f"TX Signal:")
-    print(f"  Transitions (edges): {tx_transitions}")
-    print(f"  High time: {tx_high_time:.3f} ms")
-    print(f"  Activity: {tx_transitions > 0 and '✓ Active' or '✗ No activity'}")
-    
-    print(f"\nRX Signal:")
-    print(f"  Transitions (edges): {rx_transitions}")
-    print(f"  High time: {rx_high_time:.3f} ms")
-    print(f"  Activity: {rx_transitions > 0 and '✓ Active' or '✗ No activity'}")
-    
-    if len(tx_first_edge) > 0 and len(rx_first_edge) > 0:
-        print(f"\nPropagation Delay: {propagation_delay:.2f} μs")
-    
-    # Estimate bit rate from transitions
-    if tx_transitions > 2:
-        capture_duration = len(tx_data) / sample_rate  # seconds
-        estimated_bit_rate = (tx_transitions / 2) / capture_duration  # approximate
-        print(f"Estimated Bit Rate: {estimated_bit_rate/1000:.1f} kbps")
-    
-    print("="*50 + "\n")
-    
-    # Warnings
-    if tx_transitions == 0 and rx_transitions == 0:
-        print("⚠ WARNING: No signal activity detected!")
-        print("  Check the wiring and ensure transmitter is running.\n")
-
-def save_capture(time_ms, tx_data, rx_data):
-    """Save captured data to CSV file"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"logic_capture_{timestamp}.csv"
-    
-    # Create data matrix
-    data_matrix = np.column_stack((time_ms, tx_data, rx_data))
-    
-    # Save with header
-    np.savetxt(filename, data_matrix, delimiter=',', 
-               header='Time_ms,TX,RX', comments='', fmt='%.6f,%d,%d')
-    
-    print(f"✓ Data saved to: {filename}\n")
-    return filename
-
-def plot_signals(time_ms, tx_data, rx_data, fig, ax_tx, ax_rx):
-    """Plot TX and RX signals"""
-    # Clear previous plots
-    ax_tx.clear()
-    ax_rx.clear()
-    
-    # Plot as step functions (digital signals)
-    ax_tx.step(time_ms, tx_data, where='post', linewidth=1.5, color='red', label='TX')
-    ax_rx.step(time_ms, rx_data, where='post', linewidth=1.5, color='blue', label='RX')
-    
-    # Configure TX axis
-    ax_tx.set_title(f'TX Signal (GPIO {TX_PIN})', fontsize=12, fontweight='bold')
-    ax_tx.set_ylabel('Logic Level', fontsize=10)
-    ax_tx.set_ylim(-0.1, 1.2)
-    ax_tx.set_yticks([0, 1])
-    ax_tx.set_yticklabels(['LOW', 'HIGH'])
-    ax_tx.grid(True, alpha=0.3)
-    ax_tx.legend(loc='upper right')
-    
-    # Configure RX axis
-    ax_rx.set_title(f'RX Signal (GPIO {RX_PIN})', fontsize=12, fontweight='bold')
-    ax_rx.set_xlabel('Time (ms)', fontsize=10)
-    ax_rx.set_ylabel('Logic Level', fontsize=10)
-    ax_rx.set_ylim(-0.1, 1.2)
-    ax_rx.set_yticks([0, 1])
-    ax_rx.set_yticklabels(['LOW', 'HIGH'])
-    ax_rx.grid(True, alpha=0.3)
-    ax_rx.legend(loc='upper right')
-    
-    # Update display
-    fig.tight_layout()
-    fig.canvas.draw()
-    fig.canvas.flush_events()
-
-def run_logic_analyzer():
-    """Main logic analyzer loop"""
-    
-    # Show available ports
-    available_ports = list_serial_ports()
-    
-    if not available_ports:
-        print("\n✗ No serial ports detected. Please connect the ESP32.")
-        return
-    
-    # Connect to ESP32
-    ser = connect_to_esp32(COM_PORT, BAUD_RATE)
-    if ser is None:
-        return
-    
-    # Setup matplotlib for live plotting
-    plt.ion()  # Interactive mode
-    fig, (ax_tx, ax_rx) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
-    fig.suptitle('ESP32 Logic Analyzer - CECS 460 Lab 5', fontsize=14, fontweight='bold')
-    plt.show()
-    
-    # Calculate time array
-    time_us = np.arange(SAMPLES_PER_CAPTURE) * (1e6 / SAMPLE_RATE_HZ)  # Microseconds
-    time_ms = time_us / 1000  # Convert to milliseconds
-    
-    capture_count = 0
-    
-    print("="*50)
-    print("READY TO CAPTURE")
-    print("="*50)
-    print("Press Ctrl+C to exit\n")
-    
-    try:
-        while True:
-            # Read one byte at a time looking for start marker
-            if ser.in_waiting > 0:
-                byte_data = ser.read(1)
-                incoming_byte = byte_data[0]
-                
-                # Check for start marker
-                if incoming_byte == START_MARKER:
-                    capture_count += 1
-                    print(f"\n[Capture #{capture_count}] Start marker received - Reading data...")
-                    
-                    # Read the data block
-                    raw_data = ser.read(SAMPLES_PER_CAPTURE)
-                    
-                    # Read end marker
-                    end_marker_byte = ser.read(1)
-                    
-                    # Validate reception
-                    if not end_marker_byte or end_marker_byte[0] != END_MARKER:
-                        print("✗ ERROR: End marker 'E' not received. Data may be corrupted.")
-                        continue
-                    
-                    if len(raw_data) != SAMPLES_PER_CAPTURE:
-                        print(f"✗ ERROR: Expected {SAMPLES_PER_CAPTURE} bytes, got {len(raw_data)}")
-                        continue
-                    
-                    print(f"✓ Received {len(raw_data)} samples successfully")
-                    
-                    # Decode the data
-                    tx_data, rx_data = decode_capture(raw_data)
-                    
-                    # Analyze signals
-                    analyze_signal(tx_data, rx_data, SAMPLE_RATE_HZ)
-                    
-                    # Plot the results
-                    plot_signals(time_ms, tx_data, rx_data, fig, ax_tx, ax_rx)
-                    
-                    # Ask user if they want to save
-                    save_prompt = input("Save this capture to CSV? (y/n): ").strip().lower()
-                    if save_prompt == 'y':
-                        save_capture(time_ms, tx_data, rx_data)
-                    
-                    print("\nWaiting for next trigger...\n")
-                
-            else:
-                time.sleep(0.01)  # Small delay to prevent busy-waiting
-                
-    except KeyboardInterrupt:
-        print("\n\n" + "="*50)
-        print("Program terminated by user")
-        print("="*50)
-        print(f"Total captures: {capture_count}")
-        
+        ani.save(gif_path, writer=PillowWriter(fps=12))
     except Exception as e:
-        print(f"\n✗ Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-    finally:
-        # Cleanup
-        if ser and ser.is_open:
-            ser.close()
-            print("\n✓ Serial connection closed")
-        
-        plt.ioff()
-        plt.show()  # Keep final plot open
-        print("\n✓ Plot window will remain open")
+        print("GIF save failed (install pillow). Error:", e)
+    plt.close(fig2)
+
+    # ----- Tiny VCD sample -----
+    vcd_channels = {
+        "TX_BIT":   tx_bit_line[:N].astype(int),
+        "SYM_CLK":  sym_clk[:N].astype(int),
+        "RX_SIGN":  to_logic_levels(bb[:N]).astype(int),
+        "RX_BIT":   rx_bit_line[:N].astype(int),
+        "BIT_EDGE": edge[:N].astype(int),
+    }
+    vcd_path = Path("bpsk_demo.vcd")
+    write_vcd(vcd_channels, fs=fs, path=vcd_path, timescale='1us')
+
+    print("\nGenerated:")
+    print(" -", static_png.resolve())
+    print(" -", gif_path.resolve())
+    print(" -", vcd_path.resolve())
 
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("ESP32 LOGIC ANALYZER - CECS 460 LAB 5")
-    print("="*50)
-    run_logic_analyzer()
+    main()
