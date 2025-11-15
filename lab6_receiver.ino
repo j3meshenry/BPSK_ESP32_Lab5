@@ -1,4 +1,8 @@
 // ===== Your original wiring (unchanged) =====
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2   // Most ESP32 boards use GPIO 2 for the onboard LED
+#endif
+
 #define TXD2 23
 #define RXD2 22
 
@@ -41,10 +45,8 @@ bool parse_hex_frame(const String& line, uint8_t* out, size_t* out_len) {
   // token by spaces
   int idx = 0;
   while (idx < (int)bytes.length()) {
-    // skip spaces
     while (idx < (int)bytes.length() && isspace(bytes[idx])) idx++;
     if (idx >= (int)bytes.length()) break;
-    // read token until space
     int j = idx;
     while (j < (int)bytes.length() && !isspace(bytes[j])) j++;
     String tok = bytes.substring(idx, j);
@@ -52,7 +54,7 @@ bool parse_hex_frame(const String& line, uint8_t* out, size_t* out_len) {
     if (tok.length() == 0) break;
     char* endptr = nullptr;
     long v = strtol(tok.c_str(), &endptr, 16);
-    if (*out_len >= 64 || v < 0 || v > 255) return false; // simple guard
+    if (*out_len >= 64 || v < 0 || v > 255) return false;
     out[(*out_len)++] = (uint8_t)v;
     idx = j;
   }
@@ -61,43 +63,39 @@ bool parse_hex_frame(const String& line, uint8_t* out, size_t* out_len) {
 
 // Validate one full frame buffer (already bytes)
 void consume_frame_and_report(const uint8_t* frame, size_t n) {
-  // Expect: SYNC, LEN, DATA[LEN], CKSUM
-  if (n < 3) { Serial.println("[ERR] frame too short"); led_err(); return; }
-  if (frame[0] != PKT_SYNC) { Serial.println("[ERR] bad SYNC"); led_err(); return; }
+  if (n < 3) { Serial.println("[ERR] frame too short"); led_err(); digitalWrite(LED_BUILTIN, LOW); return; }  // ⭐ Added
+  if (frame[0] != PKT_SYNC) { Serial.println("[ERR] bad SYNC"); led_err(); digitalWrite(LED_BUILTIN, LOW); return; }  // ⭐ Added
 
   uint8_t L = frame[1];
-  if (L > PKT_MAX_PAYLOAD) { Serial.println("[ERR] length > 8"); led_err(); return; }
-  if (n != (size_t)(3 + L - (L==0 ? 1 : 0))) {
-    // For L bytes data, total should be 3+L-? Wait—normal is SYNC(1)+LEN(1)+DATA(L)+CK(1)= L+3
-    if (n != (size_t)(L + 3)) { Serial.println("[ERR] size mismatch"); led_err(); return; }
-  }
+  if (L > PKT_MAX_PAYLOAD) { Serial.println("[ERR] length > 8"); led_err(); digitalWrite(LED_BUILTIN, LOW); return; }  // ⭐ Added
+  if (n != (size_t)(L + 3)) { Serial.println("[ERR] size mismatch"); led_err(); digitalWrite(LED_BUILTIN, LOW); return; }  // ⭐ Added
 
   const uint8_t* data = &frame[2];
   uint8_t rx_cksum   = frame[2 + L];
 
-  // Receiver-side fault: pretend checksum is wrong if mode is set
+  Serial.printf("TX CHECKSUM: 0x%02X\n", rx_cksum);
+
   uint8_t calc = xor_ck(data, L);
   if (g_fault == F_CKSUM) calc ^= 0x01;
 
   if (rx_cksum == calc) {
-    // Print payload as ASCII-friendly
     Serial.print("PAYLOAD: ");
     for (uint8_t i=0;i<L;i++) Serial.print((char)data[i]);
     Serial.println("  [OK]");
     led_ok();
+    digitalWrite(LED_BUILTIN, HIGH);  // ⭐ Added — onboard LED ON when valid message received
   } else {
     Serial.println("[ERR] checksum mismatch");
     led_err();
+    digitalWrite(LED_BUILTIN, LOW);   // ⭐ Added — onboard LED OFF on error
   }
 }
 
-// Simulate: given a raw ASCII message, chunk into ≤8 and “verify” each
 void simulate_receive_plaintext(const String& msg) {
   const uint8_t* p = (const uint8_t*)msg.c_str();
   size_t left = msg.length();
   while (left > 0) {
     uint8_t L = (left > PKT_MAX_PAYLOAD) ? PKT_MAX_PAYLOAD : (uint8_t)left;
-    // build a local frame (SYNC LEN DATA CK)
     uint8_t frame[1 + 1 + PKT_MAX_PAYLOAD + 1];
     size_t n = 0;
     frame[n++] = PKT_SYNC;
@@ -111,7 +109,6 @@ void simulate_receive_plaintext(const String& msg) {
   }
 }
 
-// Optional: help text
 void print_help() {
   Serial.println("UART RX BPSK-sim commands:");
   Serial.println("  MSG:<text>            (simulate frames from text)");
@@ -126,24 +123,24 @@ void setup() {
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   Serial.println("ESP32 #2 - Receiver Ready (UART-sim BPSK packets)");
   led_init();
+  pinMode(LED_BUILTIN, OUTPUT);      // ⭐ Added
+  digitalWrite(LED_BUILTIN, LOW);    // ⭐ Added
   print_help();
 }
 
 void loop() {
   if (Serial2.available()) {
     String incoming = Serial2.readStringUntil('\n');
-    incoming.trim(); // remove stray newlines/spaces
+    incoming.trim();
 
     if (incoming.length() > 0) {
-      // Keep your original prints/echo so nothing breaks
       Serial.println("Received: " + incoming);
       Serial2.println("Echo: " + incoming);
 
-      // --- New: interpret the line as a simulated packet input ---
       if (incoming.startsWith("MSG:")) {
         String msg = incoming.substring(4);
         simulate_receive_plaintext(msg);
-        g_fault = F_NONE; // auto-clear fault after a simulated run
+        g_fault = F_NONE;
       } else if (incoming.startsWith("FRAME:")) {
         uint8_t buf[64]; size_t n=0;
         if (parse_hex_frame(incoming, buf, &n)) {
@@ -152,6 +149,7 @@ void loop() {
         } else {
           Serial.println("[ERR] could not parse FRAME line");
           led_err();
+          digitalWrite(LED_BUILTIN, LOW); // ⭐ Added
         }
       } else if (incoming.startsWith("FAULT:")) {
         String m = incoming.substring(6);
@@ -162,7 +160,6 @@ void loop() {
       } else if (incoming == "HELP") {
         print_help();
       } else {
-        // If it’s just text, treat as MSG for convenience
         simulate_receive_plaintext(incoming);
         g_fault = F_NONE;
       }
